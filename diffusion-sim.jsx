@@ -129,10 +129,10 @@ const SHAPES = ["torus", "sphere", "helix", "trefoil", "möbius"];
 
 export default function DiffusionSim() {
   const mountRef  = useRef(null);
-  const stRef     = useRef({ t: 999, playing: true, speed: 4, shape: "torus", noise: null, target: null });
+  const stRef     = useRef({ t: 999, playing: true, speed: 4, shape: "torus", noise: null, target: null, forward: true });
   const gfxRef    = useRef(null);
   const dragRef   = useRef({ active: false, px: 0, py: 0, rotX: 0.25, rotY: 0 });
-  const [ui, setUi] = useState({ t: 999, playing: true, speed: 4, shape: "torus" });
+  const [ui, setUi] = useState({ t: 999, playing: true, speed: 4, shape: "torus", forward: true });
 
   // ── Initialise / reset particles ──────────────────────────────────────────
   const resetParticles = useCallback((shape) => {
@@ -145,7 +145,8 @@ export default function DiffusionSim() {
     }
     st.noise = eps;
     st.t = 999;
-    setUi(p => ({ ...p, t: 999 }));
+    st.forward = true;
+    setUi(p => ({ ...p, t: 999, forward: true }));
   }, []);
 
   // ── Three.js setup (once) ─────────────────────────────────────────────────
@@ -218,25 +219,36 @@ export default function DiffusionSim() {
 
       const st = stRef.current;
 
-      // advance timestep
+      // advance timestep: forward = noise→object (t 999→0), !forward = object→noise (t 0→999)
       if (st.playing && !looping) {
-        st.t = st.t - st.speed;
-        if (st.t <= 0) {
-          st.t = 0;
-          looping = true;
-          setTimeout(() => {
-            // re-sample noise for seamless loop
-            const eps = st.noise;
-            for (let i = 0; i < N * 3; i++) {
-              const u = Math.random() + 1e-10, v = Math.random();
-              eps[i] = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-            }
+        if (st.forward) {
+          st.t = st.t - st.speed;
+          if (st.t <= 0) {
+            st.t = 0;
+            looping = true;
+            setTimeout(() => {
+              st.forward = false;
+              looping = false;
+              setUi(p => ({ ...p, t: 0, forward: false }));
+            }, 1800);
+          } else {
+            setUi(p => ({ ...p, t: Math.round(st.t) }));
+          }
+        } else {
+          st.t = st.t + st.speed;
+          if (st.t >= 999) {
             st.t = 999;
-            looping = false;
-            setUi(p => ({ ...p, t: 999 }));
-          }, 1800);
+            looping = true;
+            setTimeout(() => {
+              // don't resample: current positions are already the noise state → seamless loop
+              st.forward = true;
+              looping = false;
+              setUi(p => ({ ...p, t: 999, forward: true }));
+            }, 1800);
+          } else {
+            setUi(p => ({ ...p, t: Math.round(st.t) }));
+          }
         }
-        setUi(p => ({ ...p, t: Math.round(Math.max(0, st.t)) }));
       }
 
       // update positions: x_t = sqrt(ᾱ_t)·x₀ + sqrt(1-ᾱ_t)·ε
