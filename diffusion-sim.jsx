@@ -124,6 +124,139 @@ const frag = `
   }
 `;
 
+// ── Sonification: particles → grains (Web Audio only) ───────────────────────
+const SHAPE_AUDIO = {
+  torus:   { root: 110,   intervals: [1, 1.5, 2, 3] },
+  sphere:  { root: 82.4,  intervals: [1, 1.25, 1.5, 2] },
+  helix:   { root: 138.6, intervals: [1, 1.414, 2, 2.828] },
+  trefoil: { root: 98,    intervals: [1, 1.333, 1.778, 2.4] },
+  möbius:  { root: 55,    intervals: [1, 1.189, 1.5, 1.782] },
+};
+
+/** Granular engine: sine grains from live particle positions; tNorm syncs with diffusion. */
+class GranularEngine {
+  constructor(ctx) {
+    this.ctx = ctx; // exposed for AudioContext.close() on toggle off / unmount
+    this.tNorm = 1.0;
+    this.shapeAudio = SHAPE_AUDIO.torus;
+    this._timer = null;
+
+    this.master = ctx.createGain();
+    this.master.gain.value = 0.7;
+
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -18;
+    comp.knee.value = 6;
+    comp.ratio.value = 4;
+    this.master.connect(comp);
+
+    const conv = ctx.createConvolver();
+    const len = ctx.sampleRate * 4;
+    const buf = ctx.createBuffer(2, len, ctx.sampleRate);
+    for (let c = 0; c < 2; c++) {
+      const d = buf.getChannelData(c);
+      for (let i = 0; i < len; i++) {
+        d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.2);
+      }
+    }
+    conv.buffer = buf;
+
+    const dryGain = ctx.createGain();
+    dryGain.gain.value = 0.72;
+    const wetGain = ctx.createGain();
+    wetGain.gain.value = 0.28;
+    comp.connect(dryGain);
+    dryGain.connect(ctx.destination);
+    comp.connect(conv);
+    conv.connect(wetGain);
+    wetGain.connect(ctx.destination);
+  }
+
+  _grain({ freq, pan, dur, gain }) {
+    const ctx = this.ctx;
+    const now = ctx.currentTime;
+
+    const osc = ctx.createOscillator();
+    const env = ctx.createGain();
+    const pnr = ctx.createStereoPanner();
+
+    osc.type = "sine";
+    osc.frequency.value = Math.max(20, Math.min(18000, freq));
+    pnr.pan.value = Math.max(-1, Math.min(1, pan));
+
+    const atk = dur * 0.3;
+    const rel = dur * 0.5;
+    env.gain.setValueAtTime(0, now);
+    env.gain.linearRampToValueAtTime(gain, now + atk);
+    env.gain.setValueAtTime(gain, now + dur - rel);
+    env.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+
+    osc.connect(env);
+    env.connect(pnr);
+    pnr.connect(this.master);
+
+    osc.start(now);
+    osc.stop(now + dur + 0.02);
+  }
+
+  _tick(sample) {
+    if (!sample || sample.length === 0) return;
+    const t = this.tNorm;
+    const { root, intervals } = this.shapeAudio;
+
+    const count = Math.round(3 + t * 20);
+
+    for (let g = 0; g < count; g++) {
+      const p = sample[Math.floor(Math.random() * sample.length)];
+
+      const harmonic = root * intervals[Math.floor(Math.random() * intervals.length)];
+      const noisePitch = root * Math.pow(2, (Math.random() - 0.5) * 3);
+      const jitter = Math.pow(2, (Math.random() * 2 - 1) * t * 1.8);
+      const freq = noisePitch * t + harmonic * jitter * (1 - t);
+
+      const structPan = Math.max(-1, Math.min(1, p.x / 3.0));
+      const noisePan = Math.random() * 2 - 1;
+      const pan = noisePan * t + structPan * (1 - t);
+
+      const dur =
+        (0.025 + (1 - t) * 0.07) + Math.random() * (0.045 + (1 - t) * 0.58);
+
+      const grainGain = (0.032 + (1 - t) * 0.052) / Math.sqrt(Math.max(1, count));
+
+      this._grain({ freq, pan, dur, gain: grainGain });
+    }
+  }
+
+  start(getSample) {
+    const tick = () => {
+      this._tick(getSample());
+      const ms = 28 + (1 - this.tNorm) * 60;
+      this._timer = setTimeout(tick, ms);
+    };
+    tick();
+  }
+
+  stop() {
+    if (this._timer != null) {
+      clearTimeout(this._timer);
+      this._timer = null;
+    }
+  }
+
+  /** tNorm in [0,1]: 1 = noise, 0 = crystal (same as visual temp). */
+  setT(tNorm) {
+    this.tNorm = tNorm;
+  }
+
+  setShape(name) {
+    this.shapeAudio = SHAPE_AUDIO[name] ?? SHAPE_AUDIO.torus;
+  }
+
+  setVolume(v) {
+    this.master.gain.linearRampToValueAtTime(v, this.ctx.currentTime + 0.05);
+  }
+}
+
 // ── Component ─────────────────────────────────────────────────────────────────
 const SHAPES = ["torus", "sphere", "helix", "trefoil", "möbius"];
 
@@ -132,7 +265,16 @@ export default function DiffusionSim() {
   const stRef     = useRef({ t: 999, playing: true, speed: 4, shape: "torus", noise: null, target: null, forward: true });
   const gfxRef    = useRef(null);
   const dragRef   = useRef({ active: false, px: 0, py: 0, rotX: 0.25, rotY: 0 });
-  const [ui, setUi] = useState({ t: 999, playing: true, speed: 4, shape: "torus", forward: true });
+  const audioRef = useRef(null);
+  const [ui, setUi] = useState({
+    t: 999,
+    playing: true,
+    speed: 4,
+    shape: "torus",
+    forward: true,
+    audioOn: false,
+    vol: 0.7,
+  });
 
   // ── Initialise / reset particles ──────────────────────────────────────────
   const resetParticles = useCallback((shape) => {
@@ -270,6 +412,8 @@ export default function DiffusionSim() {
         geo.attributes.position.needsUpdate = true;
         geo.attributes.aTemp.needsUpdate    = true;
         geo.attributes.aSize.needsUpdate    = true;
+
+        if (audioRef.current) audioRef.current.setT(tNorm);
       }
 
       // rotation
@@ -287,6 +431,13 @@ export default function DiffusionSim() {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
       window.removeEventListener("resize", onResize);
+      if (audioRef.current) {
+        try {
+          audioRef.current.stop();
+          audioRef.current.ctx.close();
+        } catch (_) {}
+        audioRef.current = null;
+      }
       renderer.dispose();
       if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
     };
@@ -295,12 +446,45 @@ export default function DiffusionSim() {
   const changeShape = (s) => {
     stRef.current.shape = s;
     resetParticles(s);
+    if (audioRef.current) audioRef.current.setShape(s);
     setUi(p => ({ ...p, shape: s }));
   };
 
   const togglePlay = () => {
     stRef.current.playing = !stRef.current.playing;
     setUi(p => ({ ...p, playing: !p.playing }));
+  };
+
+  const toggleAudio = () => {
+    if (audioRef.current) {
+      try {
+        audioRef.current.stop();
+        audioRef.current.ctx.close();
+      } catch (_) {}
+      audioRef.current = null;
+      setUi(p => ({ ...p, audioOn: false }));
+      return;
+    }
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const engine = new GranularEngine(ctx);
+    engine.setShape(stRef.current.shape);
+    engine.setVolume(ui.vol);
+
+    const getSample = () => {
+      const p = gfxRef.current?.pos;
+      if (!p) return null;
+      const out = [];
+      for (let i = 0; i < 60; i++) {
+        const idx = Math.floor(Math.random() * N) * 3;
+        out.push({ x: p[idx], y: p[idx + 1], z: p[idx + 2] });
+      }
+      return out;
+    };
+
+    engine.start(getSample);
+    engine.setT(stRef.current.t / 999);
+    audioRef.current = engine;
+    setUi(p => ({ ...p, audioOn: true }));
   };
 
   const tPct = (1 - ui.t / 999) * 100;
@@ -324,6 +508,11 @@ export default function DiffusionSim() {
         <div style={{ color: "rgba(96,165,250,0.45)", fontSize: 10, letterSpacing: "0.05em" }}>
           x<sub>t</sub> = √ᾱ<sub>t</sub> · x<sub>0</sub> + √(1−ᾱ<sub>t</sub>) · ε
         </div>
+        {ui.audioOn && (
+          <div style={{ fontSize: 8, color: "rgba(96,165,250,0.4)", letterSpacing: "0.22em", marginTop: 5 }}>
+            ▪ ▪ ▪ GRANULAR ACTIVE
+          </div>
+        )}
         <div style={{ color: "rgba(255,255,255,0.12)", fontSize: 9, letterSpacing: "0.2em", marginTop: 4 }}>
           drag to rotate
         </div>
@@ -373,8 +562,8 @@ export default function DiffusionSim() {
           ))}
         </div>
 
-        {/* Play / speed */}
-        <div style={{ display: "flex", gap: 16, alignItems: "center" }}>
+        {/* Playback + granular audio */}
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", justifyContent: "center" }}>
           <button onClick={togglePlay} style={{
             ...mono, fontSize: 10, letterSpacing: "0.3em", cursor: "pointer",
             padding: "5px 18px",
@@ -393,10 +582,35 @@ export default function DiffusionSim() {
                 stRef.current.speed = v;
                 setUi(p => ({ ...p, speed: v }));
               }}
-              style={{ width: 90, accentColor: "#60a5fa", cursor: "pointer" }}
+              style={{ width: 80, accentColor: "#60a5fa", cursor: "pointer" }}
             />
-            <span style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, ...mono, width: 24 }}>{ui.speed}×</span>
+            <span style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, width: 24 }}>{ui.speed}×</span>
           </div>
+
+          <button onClick={toggleAudio} style={{
+            ...mono, fontSize: 10, letterSpacing: "0.2em", cursor: "pointer",
+            padding: "5px 14px",
+            background: ui.audioOn ? "rgba(96,165,250,0.1)" : "transparent",
+            border: `1px solid ${ui.audioOn ? "rgba(96,165,250,0.55)" : "rgba(255,255,255,0.18)"}`,
+            color: ui.audioOn ? "#60a5fa" : "rgba(255,255,255,0.4)",
+            transition: "all 0.15s",
+          }}>
+            {ui.audioOn ? "◉ SOUND ON" : "○ SOUND OFF"}
+          </button>
+
+          {ui.audioOn && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ color: "rgba(255,255,255,0.2)", fontSize: 9, letterSpacing: "0.2em" }}>VOL</span>
+              <input type="range" min={0} max={1} step={0.01} value={ui.vol}
+                onChange={e => {
+                  const v = Number(e.target.value);
+                  if (audioRef.current) audioRef.current.setVolume(v);
+                  setUi(p => ({ ...p, vol: v }));
+                }}
+                style={{ width: 70, accentColor: "#60a5fa", cursor: "pointer" }}
+              />
+            </div>
+          )}
         </div>
       </div>
 
@@ -413,6 +627,16 @@ export default function DiffusionSim() {
         <div style={{ fontSize: 8, color: "rgba(255,150,60,0.6)", letterSpacing: "0.1em" }}>HOT</div>
         <div style={{ fontSize: 8, color: "rgba(56,189,248,0.6)", letterSpacing: "0.1em", marginTop: 2 }}>COLD</div>
       </div>
+
+      {!ui.audioOn && (
+        <div style={{
+          position: "absolute", bottom: 148, left: "50%", transform: "translateX(-50%)",
+          ...mono, fontSize: 8, color: "rgba(255,255,255,0.11)", letterSpacing: "0.25em",
+          pointerEvents: "none", whiteSpace: "nowrap",
+        }}>
+          click SOUND OFF to activate granular sonification
+        </div>
+      )}
 
     </div>
   );
